@@ -1,0 +1,224 @@
+/**
+ * Anthropic → NVIDIA NIM Proxy (Standalone)
+ * Maps Claude Code CLI Anthropic API formats to OpenAI for NVIDIA NIM.
+ */
+
+import express from 'express'
+import OpenAI from 'openai'
+import dotenv from 'dotenv'
+
+dotenv.config()
+
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || ''
+const NVIDIA_BASE_URL = process.env.NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1'
+const DEFAULT_MODEL = process.env.NVIDIA_MODEL || 'moonshotai/kimi-k2.6'
+const PORT = 8082
+
+const nvidia = new OpenAI({ apiKey: NVIDIA_API_KEY, baseURL: NVIDIA_BASE_URL })
+
+const app = express()
+app.use(express.json({ limit: '20mb' }))
+
+// ─── Format Converters ────────────────────────────────────────────────────────
+function toOpenAIMessages(system, anthropicMsgs) {
+  const out = []
+  if (system) out.push({ role: 'system', content: system })
+
+  for (const msg of anthropicMsgs) {
+    const { role, content } = msg
+
+    if (typeof content === 'string') {
+      out.push({ role, content })
+      continue
+    }
+    if (!Array.isArray(content)) continue
+
+    const toolResults = content.filter(b => b.type === 'tool_result')
+    const rest = content.filter(b => b.type !== 'tool_result')
+
+    if (rest.length > 0) {
+      const toolCalls = rest.filter(b => b.type === 'tool_use')
+      const textBlocks = rest.filter(b => b.type === 'text')
+      const textContent = textBlocks.map(b => b.text).join('') || null
+
+      if (toolCalls.length > 0) {
+        out.push({
+          role: 'assistant',
+          content: textContent,
+          tool_calls: toolCalls.map(tc => ({
+            id: tc.id,
+            type: 'function',
+            function: { name: tc.name, arguments: JSON.stringify(tc.input ?? {}) }
+          }))
+        })
+      } else if (textContent) {
+        out.push({ role, content: textContent })
+      }
+    }
+
+    for (const tr of toolResults) {
+      const resultText = typeof tr.content === 'string'
+        ? tr.content
+        : Array.isArray(tr.content)
+          ? tr.content.map(c => c.text ?? JSON.stringify(c)).join('\n')
+          : String(tr.content ?? '')
+      out.push({ role: 'tool', tool_call_id: tr.tool_use_id, content: resultText })
+    }
+  }
+  return out
+}
+
+function toOpenAITools(tools) {
+  if (!tools?.length) return undefined
+  return tools.map(t => ({
+    type: 'function',
+    function: { name: t.name, description: t.description ?? '', parameters: t.input_schema ?? {} }
+  }))
+}
+
+function toAnthropicResponse(completion, model) {
+  const choice = completion.choices?.[0]
+  const msg = choice?.message ?? {}
+  const content = []
+
+  if (msg.content) content.push({ type: 'text', text: msg.content })
+  if (msg.tool_calls?.length) {
+    for (const tc of msg.tool_calls) {
+      let input = {}
+      try { input = JSON.parse(tc.function.arguments || '{}') } catch {}
+      content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input })
+    }
+  }
+
+  const finishReason = choice?.finish_reason
+  const stopReason = finishReason === 'tool_calls' ? 'tool_use' : finishReason === 'length' ? 'max_tokens' : 'end_turn'
+
+  return {
+    id: 'msg_' + (completion.id ?? Date.now()),
+    type: 'message',
+    role: 'assistant',
+    content,
+    model: model ?? completion.model,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: completion.usage?.prompt_tokens ?? 0,
+      output_tokens: completion.usage?.completion_tokens ?? 0
+    }
+  }
+}
+
+// ─── SSE Helper ─────────────────────────────────────────────────────
+function sse(res, event) {
+  res.write(`data: ${JSON.stringify(event)}\n\n`)
+}
+
+// ─── Main Endpoint ────────────────────────────────────────────────────────────
+app.post('/v1/messages', async (req, res) => {
+  const { model, messages, tools, system, max_tokens, stream, temperature, top_p } = req.body
+  const targetModel = model || DEFAULT_MODEL
+
+  const openaiMessages = toOpenAIMessages(system, messages ?? [])
+  const openaiTools = toOpenAITools(tools)
+
+  const params = {
+    model: targetModel,
+    messages: openaiMessages,
+    max_tokens: max_tokens ?? 8096,
+    ...(temperature != null ? { temperature } : {}),
+    ...(top_p != null ? { top_p } : {}),
+    ...(openaiTools ? { tools: openaiTools, tool_choice: 'auto' } : {})
+  }
+
+  if (stream) {
+    res.setHeader('Content-Type', 'text/event-stream')
+    res.setHeader('Cache-Control', 'no-cache')
+    res.setHeader('Connection', 'keep-alive')
+    res.setHeader('Access-Control-Allow-Origin', '*')
+
+    const msgId = 'msg_' + Date.now()
+    sse(res, {
+      type: 'message_start',
+      message: { id: msgId, type: 'message', role: 'assistant', content: [], model: targetModel, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } }
+    })
+
+    try {
+      const oStream = await nvidia.chat.completions.create({ ...params, stream: true })
+      let blockIndex = 0
+      let textStarted = false
+      const toolBlocks = {}
+
+      for await (const chunk of oStream) {
+        const delta = chunk.choices?.[0]?.delta
+        const finish = chunk.choices?.[0]?.finish_reason
+        const usage = chunk.usage
+
+        if (delta?.content) {
+          if (!textStarted) {
+            sse(res, { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } })
+            textStarted = true
+          }
+          sse(res, { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: delta.content } })
+        }
+
+        if (delta?.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            const tcIdx = tc.index
+            if (!toolBlocks[tcIdx]) {
+              if (textStarted && !toolBlocks[tcIdx]) blockIndex++
+              const bIdx = textStarted ? blockIndex : blockIndex++
+              toolBlocks[tcIdx] = { blockIdx: bIdx, id: tc.id ?? `call_${tcIdx}`, name: tc.function?.name ?? '', args: '' }
+              sse(res, {
+                type: 'content_block_start', index: toolBlocks[tcIdx].blockIdx,
+                content_block: { type: 'tool_use', id: toolBlocks[tcIdx].id, name: toolBlocks[tcIdx].name, input: {} }
+              })
+            }
+            if (tc.function?.name && !toolBlocks[tcIdx].name) toolBlocks[tcIdx].name = tc.function.name
+            if (tc.function?.arguments) {
+              toolBlocks[tcIdx].args += tc.function.arguments
+              sse(res, {
+                type: 'content_block_delta', index: toolBlocks[tcIdx].blockIdx,
+                delta: { type: 'input_json_delta', partial_json: tc.function.arguments }
+              })
+            }
+          }
+        }
+
+        if (finish) {
+          if (textStarted) sse(res, { type: 'content_block_stop', index: 0 })
+          for (const tb of Object.values(toolBlocks)) {
+            sse(res, { type: 'content_block_stop', index: tb.blockIdx })
+          }
+          const stopReason = finish === 'tool_calls' ? 'tool_use' : finish === 'length' ? 'max_tokens' : 'end_turn'
+          sse(res, { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: usage?.completion_tokens ?? 0 } })
+          sse(res, { type: 'message_stop' })
+        }
+      }
+      res.end()
+
+    } catch (err) {
+      console.error('[proxy] Stream error:', err.message)
+      sse(res, { type: 'error', error: { type: 'api_error', message: err.message } })
+      res.end()
+    }
+  } else {
+    try {
+      const completion = await nvidia.chat.completions.create(params)
+      res.json(toAnthropicResponse(completion, targetModel))
+    } catch (err) {
+      console.error('[proxy] Error:', err.message)
+      res.status(500).json({ type: 'error', error: { type: 'api_error', message: err.message } })
+    }
+  }
+})
+
+app.get('/health', (_, res) => res.json({ status: 'ok', model: DEFAULT_MODEL, backend: NVIDIA_BASE_URL }))
+app.get('/v1/models', (_, res) => res.json({ data: [{ id: DEFAULT_MODEL, object: 'model', owned_by: 'nvidia' }] }))
+
+app.listen(PORT, () => {
+  console.log(`\n🚀  GLOBAL Anthropic→NVIDIA Proxy running on http://localhost:${PORT}`)
+  console.log(`📡  Backend : ${NVIDIA_BASE_URL}`)
+  console.log(`🤖  Model   : ${DEFAULT_MODEL}`)
+  console.log(`\n   Point Claude Code at: ANTHROPIC_BASE_URL=http://localhost:${PORT}`)
+  console.log(`   ANTHROPIC_API_KEY=sk-nvidia-proxy\n`)
+})

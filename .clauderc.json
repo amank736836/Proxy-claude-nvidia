@@ -1,0 +1,7 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8082",
+    "ANTHROPIC_API_KEY": "sk-nvidia-proxy",
+    "ANTHROPIC_MODEL": "moonshotai/kimi-k2.6"
+  }
+}

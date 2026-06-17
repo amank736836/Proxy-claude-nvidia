@@ -27,6 +27,18 @@ A standalone local proxy that translates Anthropic API formats (used by the Clau
    NVIDIA_MODEL=moonshotai/kimi-k2.6
    ```
 
+### Rate limiting
+
+The free NVIDIA NIM tier caps each model at **40 requests/minute**. To keep Claude Code from hitting that wall during a burst of parallel tool calls, the proxy applies a local sliding-window limiter before forwarding anything upstream:
+
+- `NVIDIA_RPM_LIMIT` (default `40`) — max requests in any rolling 60s window
+- `NVIDIA_RPM_MAX_WAIT_MS` (default `8000`) — how long a single Claude Code request will queue waiting for a slot before the proxy returns HTTP 429
+- `NVIDIA_RPM_429_BACKOFF_MS` (default `15000`) — if NVIDIA itself returns 429 (e.g. a sibling tenant spike), the proxy pauses locally and rejects with 429 + `Retry-After` instead of piling more requests against a known-bad endpoint
+
+When the limit is reached, additional requests **queue silently** up to `MAX_WAIT_MS` (visible in proxy logs as `[rl] queued N deep, wait=X.Xs`). Beyond that they get an immediate `429` so Claude Code can retry.
+
+> Note: this guarantees the proxy never exceeds the local cap. NVIDIA's rate limit is enforced on their side, so a momentary 429 is still possible during a shared-tenant spike — that's what the reactive backoff above handles.
+
 ## Usage
 
 There are two primary ways to run and use the proxy:

@@ -14,6 +14,89 @@ const NVIDIA_BASE_URL = process.env.NVIDIA_BASE_URL || 'https://integrate.api.nv
 const DEFAULT_MODEL = process.env.NVIDIA_MODEL || 'moonshotai/kimi-k2.6'
 const PORT = 8082
 
+// ─── Rate Limiter (sliding-window, default 40 RPM) ───────────────────────────
+const RPM_LIMIT = (() => {
+  const n = Number(process.env.NVIDIA_RPM_LIMIT)
+  return Number.isFinite(n) && n > 0 ? n : 40
+})()
+const RPM_WINDOW_MS = 60_000
+const RPM_MAX_WAIT_MS = (() => {
+  const n = Number(process.env.NVIDIA_RPM_MAX_WAIT_MS)
+  return Number.isFinite(n) && n >= 0 ? n : 8000
+})()
+const RPM_429_BACKOFF_MS = (() => {
+  const n = Number(process.env.NVIDIA_RPM_429_BACKOFF_MS)
+  return Number.isFinite(n) && n >= 0 ? n : 15000
+})()
+
+const recentTimestamps = []   // ms timestamps of slots held (in-flight + recently completed)
+let pausedUntil = 0           // ms; while Date.now() < pausedUntil, reject immediately (no queue)
+let waitingCount = 0          // callers currently sleeping inside acquireSlot waiting for a slot
+
+function trimWindow(now) {
+  const cutoff = now - RPM_WINDOW_MS
+  while (recentTimestamps.length && recentTimestamps[0] < cutoff) recentTimestamps.shift()
+}
+
+async function acquireSlot(res) {
+  const now = Date.now()
+
+  // Reactive backoff: upstream already 429'd us — don't pile on.
+  if (now < pausedUntil) {
+    const retryAfter = Math.ceil((pausedUntil - now) / 1000)
+    res.setHeader('Retry-After', String(retryAfter))
+    res.status(429).json({
+      type: 'error',
+      error: { type: 'rate_limit_error', message: `Proxy in backoff after upstream 429; retry in ${retryAfter}s` }
+    })
+    return false
+  }
+
+  trimWindow(now)
+
+  // If we're under the cap, take a slot immediately.
+  if (recentTimestamps.length < RPM_LIMIT) {
+    recentTimestamps.push(now)
+    return true
+  }
+
+  // At cap. Compute how long until the oldest slot ages out.
+  const oldest = recentTimestamps[0]
+  const waitMs = RPM_WINDOW_MS - (now - oldest)
+
+  if (waitMs > RPM_MAX_WAIT_MS) {
+    console.log(`[rl] 429 to client: would wait ${(waitMs/1000).toFixed(1)}s > ${RPM_MAX_WAIT_MS/1000}s cap`)
+    res.setHeader('Retry-After', String(Math.ceil(waitMs / 1000)))
+    res.status(429).json({
+      type: 'error',
+      error: { type: 'rate_limit_error', message: `Upstream rate limit (${RPM_LIMIT}/min) reached; retry in ${Math.ceil(waitMs/1000)}s` }
+    })
+    return false
+  }
+
+  // Queue: wait, then re-check and take the slot.
+  waitingCount++
+  const depth = waitingCount
+  console.log(`[rl] queued ${depth} deep, wait=${(waitMs/1000).toFixed(1)}s`)
+  await new Promise(r => setTimeout(r, waitMs))
+  waitingCount = Math.max(0, waitingCount - 1)
+  trimWindow(Date.now())
+  recentTimestamps.push(Date.now())
+  return true
+}
+
+function isRateLimitError(err) {
+  if (!err) return false
+  if (err.status === 429 || err.statusCode === 429) return true
+  const msg = String(err.message ?? err)
+  return /rate.?limit/i.test(msg) || /\b429\b/.test(msg)
+}
+
+function triggerUpstreamBackoff() {
+  pausedUntil = Date.now() + RPM_429_BACKOFF_MS
+  console.log(`[rl] upstream 429 → pausing limiter ${RPM_429_BACKOFF_MS/1000}s`)
+}
+
 const nvidia = new OpenAI({ apiKey: NVIDIA_API_KEY, baseURL: NVIDIA_BASE_URL })
 
 const app = express()
@@ -131,6 +214,8 @@ app.post('/v1/messages', async (req, res) => {
   }
 
   if (stream) {
+    if (!(await acquireSlot(res))) return
+
     res.setHeader('Content-Type', 'text/event-stream')
     res.setHeader('Cache-Control', 'no-cache')
     res.setHeader('Connection', 'keep-alive')
@@ -197,17 +282,25 @@ app.post('/v1/messages', async (req, res) => {
       res.end()
 
     } catch (err) {
+      if (isRateLimitError(err)) triggerUpstreamBackoff()
       console.error('[proxy] Stream error:', err.message)
-      sse(res, { type: 'error', error: { type: 'api_error', message: err.message } })
-      res.end()
+      try {
+        sse(res, { type: 'error', error: { type: isRateLimitError(err) ? 'rate_limit_error' : 'api_error', message: err.message } })
+        res.end()
+      } catch {}
     }
   } else {
+    if (!(await acquireSlot(res))) return
     try {
       const completion = await nvidia.chat.completions.create(params)
       res.json(toAnthropicResponse(completion, targetModel))
     } catch (err) {
+      if (isRateLimitError(err)) triggerUpstreamBackoff()
       console.error('[proxy] Error:', err.message)
-      res.status(500).json({ type: 'error', error: { type: 'api_error', message: err.message } })
+      res.status(isRateLimitError(err) ? 429 : 500).json({
+        type: 'error',
+        error: { type: isRateLimitError(err) ? 'rate_limit_error' : 'api_error', message: err.message }
+      })
     }
   }
 })
@@ -219,6 +312,7 @@ app.listen(PORT, () => {
   console.log(`\n🚀  GLOBAL Anthropic→NVIDIA Proxy running on http://localhost:${PORT}`)
   console.log(`📡  Backend : ${NVIDIA_BASE_URL}`)
   console.log(`🤖  Model   : ${DEFAULT_MODEL}`)
+  console.log(`🚦  Rate limit: ${RPM_LIMIT}/min (queue cap ${RPM_MAX_WAIT_MS/1000}s, backoff ${RPM_429_BACKOFF_MS/1000}s on upstream 429)`)
   console.log(`\n   Point Claude Code at: ANTHROPIC_BASE_URL=http://localhost:${PORT}`)
   console.log(`   ANTHROPIC_API_KEY=sk-nvidia-proxy\n`)
 })

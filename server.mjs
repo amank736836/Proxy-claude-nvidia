@@ -13,6 +13,10 @@ const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || ''
 const NVIDIA_BASE_URL = process.env.NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1'
 const DEFAULT_MODEL = process.env.NVIDIA_MODEL || 'moonshotai/kimi-k2.6'
 const PORT = 8082
+// Bind to loopback only by default: the proxy holds the NVIDIA API key and has
+// no client authentication, so it must not be reachable from the network.
+// Set HOST=0.0.0.0 explicitly if you really need LAN access.
+const HOST = process.env.HOST || '127.0.0.1'
 
 // ─── Rate Limiter (sliding-window, default 40 RPM) ───────────────────────────
 const RPM_LIMIT = (() => {
@@ -219,7 +223,6 @@ app.post('/v1/messages', async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream')
     res.setHeader('Cache-Control', 'no-cache')
     res.setHeader('Connection', 'keep-alive')
-    res.setHeader('Access-Control-Allow-Origin', '*')
 
     const msgId = 'msg_' + Date.now()
     sse(res, {
@@ -285,7 +288,14 @@ app.post('/v1/messages', async (req, res) => {
       if (isRateLimitError(err)) triggerUpstreamBackoff()
       console.error('[proxy] Stream error:', err.message)
       try {
-        sse(res, { type: 'error', error: { type: isRateLimitError(err) ? 'rate_limit_error' : 'api_error', message: err.message } })
+        const rateLimited = isRateLimitError(err)
+        sse(res, {
+          type: 'error',
+          error: {
+            type: rateLimited ? 'rate_limit_error' : 'api_error',
+            message: rateLimited ? err.message : 'Upstream stream failed. See proxy logs for details.'
+          }
+        })
         res.end()
       } catch {}
     }
@@ -297,9 +307,14 @@ app.post('/v1/messages', async (req, res) => {
     } catch (err) {
       if (isRateLimitError(err)) triggerUpstreamBackoff()
       console.error('[proxy] Error:', err.message)
-      res.status(isRateLimitError(err) ? 429 : 500).json({
+      const rateLimited = isRateLimitError(err)
+      res.status(rateLimited ? 429 : 500).json({
         type: 'error',
-        error: { type: isRateLimitError(err) ? 'rate_limit_error' : 'api_error', message: err.message }
+        error: {
+          type: rateLimited ? 'rate_limit_error' : 'api_error',
+          // Don't echo raw upstream error text to the client; it is logged above.
+          message: rateLimited ? err.message : 'Upstream request failed. See proxy logs for details.'
+        }
       })
     }
   }
@@ -308,8 +323,12 @@ app.post('/v1/messages', async (req, res) => {
 app.get('/health', (_, res) => res.json({ status: 'ok', model: DEFAULT_MODEL, backend: NVIDIA_BASE_URL }))
 app.get('/v1/models', (_, res) => res.json({ data: [{ id: DEFAULT_MODEL, object: 'model', owned_by: 'nvidia' }] }))
 
-app.listen(PORT, () => {
-  console.log(`\n🚀  GLOBAL Anthropic→NVIDIA Proxy running on http://localhost:${PORT}`)
+if (!NVIDIA_API_KEY) {
+  console.warn('[proxy] WARNING: NVIDIA_API_KEY is not set. Upstream requests will fail.')
+}
+
+app.listen(PORT, HOST, () => {
+  console.log(`\n🚀  GLOBAL Anthropic→NVIDIA Proxy running on http://${HOST}:${PORT}`)
   console.log(`📡  Backend : ${NVIDIA_BASE_URL}`)
   console.log(`🤖  Model   : ${DEFAULT_MODEL}`)
   console.log(`🚦  Rate limit: ${RPM_LIMIT}/min (queue cap ${RPM_MAX_WAIT_MS/1000}s, backoff ${RPM_429_BACKOFF_MS/1000}s on upstream 429)`)

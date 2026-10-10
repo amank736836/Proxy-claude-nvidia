@@ -11,6 +11,11 @@
 #
 name: "CodeQL Advanced"
 
+# Least privilege: default every job to read-only; the analyze job grants
+# security-events: write explicitly below.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [ "main" ]

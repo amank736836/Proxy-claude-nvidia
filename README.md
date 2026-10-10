@@ -52,7 +52,7 @@ If you want to leave the proxy running in the background so you can use Claude C
    # OR
    npm start
    ```
-   *(The proxy will run on `http://localhost:8082`)*
+   *(The proxy listens on `http://127.0.0.1:8082` — loopback only, so it is not reachable from other machines on your network. Set `HOST=0.0.0.0` in your environment only if you intentionally want LAN access, and be aware the proxy has no client authentication.)*
 
 2. Use Claude as you normally would in another terminal. The local `.clauderc.json` file ensures that Claude automatically routes its requests to the proxy when you are working inside this repository.
 
